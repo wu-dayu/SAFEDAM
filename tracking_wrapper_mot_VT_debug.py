@@ -650,6 +650,7 @@ class DAM4SAMMOT():
             return []
 
         overlap_th = float(getattr(self, "memory_lock_overlap_th", self.vt_tracker_overlap_th))
+        alt_pred_iou_th = float(getattr(self, "memory_lock_alt_pred_iou_th", 0.7))
 
         candidate_orders = []
         candidate_scores = []
@@ -660,7 +661,11 @@ class DAM4SAMMOT():
             valid_indices = [
                 int(mask_idx)
                 for mask_idx in np.argsort(-scores)
-                if mask_idx < len(masks) and np.asarray(masks[mask_idx]).sum() > 0
+                if (
+                    mask_idx < len(masks)
+                    and np.asarray(masks[mask_idx]).sum() > 0
+                    and float(scores[mask_idx]) > alt_pred_iou_th
+                )
             ]
             candidate_orders.append(valid_indices)
             candidate_scores.append(scores)
@@ -734,6 +739,13 @@ class DAM4SAMMOT():
                     "pred_iou": 0.0,
                 })
                 continue
+            if float(candidate_scores[obj_idx][cand_idx]) <= alt_pred_iou_th:
+                resolved.append({
+                    "candidate_idx": None,
+                    "mask": None,
+                    "pred_iou": 0.0,
+                })
+                continue
             resolved.append({
                 "candidate_idx": int(cand_idx),
                 "mask": np.asarray(candidate_masks[obj_idx][cand_idx]).astype(np.uint8),
@@ -764,7 +776,6 @@ class DAM4SAMMOT():
             antialias=True,
         )
         mask_inputs = (mask_inputs >= 0.5).float()
-        print(f"current tracker: tracking_wrapper_mot_VT_debug\n")
         current_out = self.sam.track_step(
             frame_idx=self.frame_index,
             is_init_cond_frame=True,
@@ -1294,7 +1305,7 @@ class DAM4SAMMOT():
             selected_mask_idx_by_obj_idx.append(int(selected_mask_idx))
             selected_mask_is_resolved_by_obj_idx.append(bool(selected_mask_is_resolved))
             selected_pred_iou_by_obj_idx.append(
-                float(lock_choice["pred_iou"]) if selected_mask_is_resolved else float(np.max(all_ious[obj_idx]))
+                float(lock_choice["pred_iou"]) if selected_mask_is_resolved else 0.0
             )
             if selected_mask_is_resolved:
                 selected_mask_np = lock_choice["mask"]
@@ -1302,7 +1313,10 @@ class DAM4SAMMOT():
                 selected_mask_np = alternative_masks_all[obj_idx][chosen_mask_idx]
             resolved_masks_by_obj_idx.append(np.asarray(selected_mask_np).squeeze().astype(np.uint8))
 
-        m = resolved_masks_by_obj_idx
+        m = [
+            np.asarray(mask).squeeze().astype(np.uint8)
+            for mask in resolved_masks_by_obj_idx
+        ]
         n_pixels_pos = [int(mask.sum()) for mask in m]
 
         overlap_info = {}
@@ -1426,7 +1440,10 @@ class DAM4SAMMOT():
 
             # for alternative masks debug
             chosen_mask_idx = selected_mask_idx_by_obj_idx[obj_idx]
-            alternative_masks = [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != chosen_mask_idx]
+            alternative_masks = [
+                mask for i, mask in enumerate(alternative_masks_all[obj_idx])
+                if i != chosen_mask_idx and float(all_ious[obj_idx][i]) > 0.7
+            ]
             alternative_masks_to_return.append([np.asarray(mask).squeeze().astype(np.uint8) for mask in alternative_masks])
 
 
@@ -1473,6 +1490,7 @@ class DAM4SAMMOT():
 
                 selected_mask_np = memory_lock_selection[obj_idx]["mask"]
                 if selected_mask_np is None:
+                    self.overlap_update_freeze_state[obj_id] = True
                     """
                     print(
                         f"Memory lock: Frame {self.frame_index}, Obj {obj_id} has no unlocked candidate, skip memory update."
@@ -1559,6 +1577,8 @@ class DAM4SAMMOT():
                     # check for update the DRM part of the memory
                     m_idx = int(selected_mask_idx_by_obj_idx[obj_idx])
                     m_iou = float(lock_choice["pred_iou"])
+                    if m_iou <= 0.7:
+                        continue
                     # Delete the chosen predicted mask from the list of all predicted masks, leading to only alternative masks
                     alternative_masks = [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != m_idx]
 
