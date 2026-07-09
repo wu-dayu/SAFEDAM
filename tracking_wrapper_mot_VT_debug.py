@@ -658,13 +658,17 @@ class DAM4SAMMOT():
         for obj_idx in range(num_objs):
             scores = np.asarray(all_ious[obj_idx]).astype(float)
             masks = np.asarray(alternative_masks_all[obj_idx])
+            chosen_idx = int(np.argmax(scores)) if len(scores) > 0 else None
             valid_indices = [
                 int(mask_idx)
                 for mask_idx in np.argsort(-scores)
                 if (
                     mask_idx < len(masks)
                     and np.asarray(masks[mask_idx]).sum() > 0
-                    and float(scores[mask_idx]) > alt_pred_iou_th
+                    and (
+                        int(mask_idx) == chosen_idx
+                        or float(scores[mask_idx]) > alt_pred_iou_th
+                    )
                 )
             ]
             candidate_orders.append(valid_indices)
@@ -739,7 +743,11 @@ class DAM4SAMMOT():
                     "pred_iou": 0.0,
                 })
                 continue
-            if float(candidate_scores[obj_idx][cand_idx]) <= alt_pred_iou_th:
+            chosen_idx = int(np.argmax(candidate_scores[obj_idx]))
+            if (
+                int(cand_idx) != chosen_idx
+                and float(candidate_scores[obj_idx][cand_idx]) <= alt_pred_iou_th
+            ):
                 resolved.append({
                     "candidate_idx": None,
                     "mask": None,
@@ -1290,6 +1298,7 @@ class DAM4SAMMOT():
         selected_mask_idx_by_obj_idx = []
         selected_pred_iou_by_obj_idx = []
         selected_mask_is_resolved_by_obj_idx = []
+        selected_mask_is_alternative_by_obj_idx = []
         resolved_masks_by_obj_idx = []
         for obj_idx in range(len(self.all_obj_ids)):
             lock_choice = memory_lock_selection[obj_idx] if obj_idx < len(memory_lock_selection) else {
@@ -1304,6 +1313,9 @@ class DAM4SAMMOT():
                 selected_mask_idx = chosen_mask_idx
             selected_mask_idx_by_obj_idx.append(int(selected_mask_idx))
             selected_mask_is_resolved_by_obj_idx.append(bool(selected_mask_is_resolved))
+            selected_mask_is_alternative_by_obj_idx.append(
+                bool(selected_mask_is_resolved and int(selected_mask_idx) != chosen_mask_idx)
+            )
             selected_pred_iou_by_obj_idx.append(
                 float(lock_choice["pred_iou"]) if selected_mask_is_resolved else 0.0
             )
@@ -1429,6 +1441,11 @@ class DAM4SAMMOT():
 
         alternative_masks_to_return = []
         vt_drm_sources = []
+        vt_spawn_allowed_this_frame = not any(
+            selected_mask_is_alternative_by_obj_idx[obj_idx]
+            and self.all_obj_ids[obj_idx] in self.real_obj_ids
+            for obj_idx in range(len(self.all_obj_ids))
+        )
         for obj_idx, obj_id in enumerate(self.all_obj_ids):
             obj_mem = self.per_object_outputs_all[obj_id]
             obj_mem_obj_ptr = self.per_object_obj_ptr[obj_id]
@@ -1477,7 +1494,11 @@ class DAM4SAMMOT():
             )
             self._record_score_iou_observation(obj_idx, score_iou, obj_score)
 
-            if self.overlap_update_freeze_state.get(obj_id, False):
+            has_resolved_mask = bool(selected_mask_is_resolved_by_obj_idx[obj_idx])
+            was_frozen = bool(self.overlap_update_freeze_state.get(obj_id, False))
+            if has_resolved_mask:
+                self.overlap_update_freeze_state[obj_id] = False
+            elif was_frozen:
                 """
                 print(f"Frame {self.frame_index} Obj {obj_id} Update Frozen due to Overlap, ratio={low_obj_max_overlap.get(obj_id, 0.0):.4f}")
                 """
@@ -1624,10 +1645,12 @@ class DAM4SAMMOT():
                             """
                             if np.min(np.array(ious)) <= 0.7:
                                 self.last_added[obj_idx] = self.frame_index # Update the last added frame index
-                                alternative_evidence = self._build_vt_alternative_evidence(
-                                    [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != m_idx],
-                                    chosen_mask_np,
-                                )
+                                alternative_evidence = []
+                                if vt_spawn_allowed_this_frame and not selected_mask_is_alternative_by_obj_idx[obj_idx]:
+                                    alternative_evidence = self._build_vt_alternative_evidence(
+                                        [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != m_idx],
+                                        chosen_mask_np,
+                                    )
                                 if obj_id in self.real_obj_ids and alternative_evidence:
                                     x, y, w, h = chosen_bbox
                                     alt_evidence_bboxes = [
@@ -1708,15 +1731,16 @@ class DAM4SAMMOT():
             
         tracked_obj_ids = list(self.all_obj_ids)
             
-        self._maybe_spawn_virtual_trackers(
-            image=image,
-            masks=m,
-            drm_sources=vt_drm_sources,
-            img=img,
-            feats=feats,
-            pos=pos,
-            feat_sizes=feat_sizes,
-        )
+        if vt_spawn_allowed_this_frame:
+            self._maybe_spawn_virtual_trackers(
+                image=image,
+                masks=m,
+                drm_sources=vt_drm_sources,
+                img=img,
+                feats=feats,
+                pos=pos,
+                feat_sizes=feat_sizes,
+            )
         real_indices = [
             obj_idx
             for obj_idx, obj_id in enumerate(tracked_obj_ids)
