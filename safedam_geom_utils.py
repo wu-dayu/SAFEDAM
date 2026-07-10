@@ -89,3 +89,95 @@ def mask_to_lowres_tensor(mask, target_hw, device):
             align_corners=False,
         )
     return (mask_tensor >= 0.5).float()
+
+
+def recent_median(values, window):
+    """Median of the last ``window`` values (None if empty)."""
+    if len(values) == 0:
+        return None
+    return float(np.median(values[-window:]))
+
+
+def recent_mean(values, window):
+    """Mean of the last ``window`` values (None if empty)."""
+    if len(values) == 0:
+        return None
+    return float(np.mean(values[-window:]))
+
+
+def candidate_overlaps_existing_tracker(candidate_mask, tracker_masks, overlap_th,
+                                        tracker_obj_ids=None):
+    """Whether a candidate mask overlaps any existing tracker beyond overlap_th.
+
+    Returns (covered, max_ratio_candidate, max_ratio_tracker, obj_id). ``obj_id``
+    is the first tracker id that triggered rejection, else the id of the max
+    overlap seen (or None when tracker_obj_ids is not provided).
+    """
+    max_ratio_candidate = 0.0
+    max_ratio_tracker = 0.0
+    max_tracker_obj_id = None
+    for tracker_idx, tracker_mask in enumerate(tracker_masks):
+        ratio_candidate, ratio_tracker, _ = largest_component_overlap_ratios(
+            candidate_mask, tracker_mask
+        )
+        if max(ratio_candidate, ratio_tracker) > max(max_ratio_candidate, max_ratio_tracker):
+            max_tracker_obj_id = (
+                tracker_obj_ids[tracker_idx]
+                if tracker_obj_ids is not None and tracker_idx < len(tracker_obj_ids)
+                else None
+            )
+        max_ratio_candidate = max(max_ratio_candidate, ratio_candidate)
+        max_ratio_tracker = max(max_ratio_tracker, ratio_tracker)
+        if (
+            ratio_candidate >= overlap_th
+            or ratio_tracker >= overlap_th
+        ):
+            reject_obj_id = (
+                tracker_obj_ids[tracker_idx]
+                if tracker_obj_ids is not None and tracker_idx < len(tracker_obj_ids)
+                else None
+            )
+            return True, ratio_candidate, ratio_tracker, reject_obj_id
+    return False, max_ratio_candidate, max_ratio_tracker, max_tracker_obj_id
+
+
+def build_vt_alternative_evidence(alternative_masks, chosen_mask, min_pixels):
+    """Largest-component alternative masks (minus the chosen mask) above min_pixels."""
+    chosen_mask = np.asarray(chosen_mask).astype(bool)
+    evidence_masks = []
+    for alt_mask in alternative_masks:
+        alt_mask = np.asarray(alt_mask).squeeze().astype(bool)
+        alt_mask = np.logical_and(alt_mask, np.logical_not(chosen_mask)).astype(np.uint8)
+        if int(alt_mask.sum()) < min_pixels:
+            continue
+        alt_largest = keep_largest_component(alt_mask)
+        if int(alt_largest.sum()) < min_pixels:
+            continue
+        evidence_masks.append(alt_largest.astype(bool))
+    return evidence_masks
+
+
+def candidate_matches_alternative_evidence(candidate_mask, alternative_evidence,
+                                           candidate_th, alt_th):
+    """Whether a candidate bbox matches any alternative-evidence bbox.
+
+    Returns (matched, best_ratio_candidate, best_ratio_alt).
+    """
+    if not alternative_evidence or not np.any(candidate_mask):
+        return False, 0.0, 0.0
+    candidate_bbox = npmask2box(candidate_mask)
+    best_ratio_candidate = 0.0
+    best_ratio_alt = 0.0
+    for evidence_mask in alternative_evidence:
+        alternative_bbox = npmask2box(evidence_mask)
+        ratio_candidate, ratio_alt, _ = bbox_overlap_ratios(
+            candidate_bbox, alternative_bbox
+        )
+        best_ratio_candidate = max(best_ratio_candidate, ratio_candidate)
+        best_ratio_alt = max(best_ratio_alt, ratio_alt)
+        if (
+            ratio_candidate >= candidate_th
+            and ratio_alt >= alt_th
+        ):
+            return True, ratio_candidate, ratio_alt
+    return False, best_ratio_candidate, best_ratio_alt

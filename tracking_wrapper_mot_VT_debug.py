@@ -14,8 +14,12 @@ from safedam_geom_utils import (
     keep_largest_component,
     npmask2box,
     largest_component_overlap_ratios,
-    bbox_overlap_ratios,
     mask_to_lowres_tensor,
+    recent_median,
+    recent_mean,
+    candidate_overlaps_existing_tracker,
+    build_vt_alternative_evidence,
+    candidate_matches_alternative_evidence,
 )
 from safedam_tracker_config import SafeDAMConfig
 
@@ -282,25 +286,6 @@ class DAM4SAMMOT():
             self.accepted_score_iou_ema.append(None)
             self.last_update_score_iou.append(None)
 
-    def _recent_median(self, values, window=None):
-        if len(values) == 0:
-            return None
-        if window is None:
-            window = self.update_gate_window
-        return float(np.median(values[-window:]))
-
-    def _recent_mean(self, values, window=None):
-        if len(values) == 0:
-            return None
-        if window is None:
-            window = self.update_gate_moving_window
-        return float(np.mean(values[-window:]))
-
-    def _format_gate_value(self, value):
-        if value is None:
-            return "None"
-        return f"{value:.4f}"
-
     def _get_adaptive_update_gate(
         self,
         obj_idx,
@@ -321,8 +306,8 @@ class DAM4SAMMOT():
         else:
             moving_avg_scores = accepted_scores
             ema = self.accepted_score_iou_ema[obj_idx]
-        accepted_median = self._recent_median(accepted_scores, window=len(accepted_scores))
-        moving_avg = self._recent_mean(moving_avg_scores)
+        accepted_median = recent_median(accepted_scores, window=len(accepted_scores))
+        moving_avg = recent_mean(moving_avg_scores, window=self.update_gate_moving_window)
         last_score = self.last_update_score_iou[obj_idx]
 
         threshold = self.update_gate_score_iou_floor
@@ -475,68 +460,6 @@ class DAM4SAMMOT():
                 self.accepted_score_iou_ema.pop(obj_idx)
             if obj_idx < len(self.last_update_score_iou):
                 self.last_update_score_iou.pop(obj_idx)
-
-    def _candidate_overlaps_existing_tracker(self, candidate_mask, tracker_masks, tracker_obj_ids=None):
-        max_ratio_candidate = 0.0
-        max_ratio_tracker = 0.0
-        max_tracker_obj_id = None
-        for tracker_idx, tracker_mask in enumerate(tracker_masks):
-            ratio_candidate, ratio_tracker, _ = largest_component_overlap_ratios(
-                candidate_mask, tracker_mask
-            )
-            if max(ratio_candidate, ratio_tracker) > max(max_ratio_candidate, max_ratio_tracker):
-                max_tracker_obj_id = (
-                    tracker_obj_ids[tracker_idx]
-                    if tracker_obj_ids is not None and tracker_idx < len(tracker_obj_ids)
-                    else None
-                )
-            max_ratio_candidate = max(max_ratio_candidate, ratio_candidate)
-            max_ratio_tracker = max(max_ratio_tracker, ratio_tracker)
-            if (
-                ratio_candidate >= self.vt_tracker_overlap_th
-                or ratio_tracker >= self.vt_tracker_overlap_th
-            ):
-                reject_obj_id = (
-                    tracker_obj_ids[tracker_idx]
-                    if tracker_obj_ids is not None and tracker_idx < len(tracker_obj_ids)
-                    else None
-                )
-                return True, ratio_candidate, ratio_tracker, reject_obj_id
-        return False, max_ratio_candidate, max_ratio_tracker, max_tracker_obj_id
-
-    def _build_vt_alternative_evidence(self, alternative_masks, chosen_mask):
-        chosen_mask = np.asarray(chosen_mask).astype(bool)
-        evidence_masks = []
-        for alt_mask in alternative_masks:
-            alt_mask = np.asarray(alt_mask).squeeze().astype(bool)
-            alt_mask = np.logical_and(alt_mask, np.logical_not(chosen_mask)).astype(np.uint8)
-            if int(alt_mask.sum()) < self.vt_alt_min_pixels:
-                continue
-            alt_largest = keep_largest_component(alt_mask)
-            if int(alt_largest.sum()) < self.vt_alt_min_pixels:
-                continue
-            evidence_masks.append(alt_largest.astype(bool))
-        return evidence_masks
-
-    def _candidate_matches_alternative_evidence(self, candidate_mask, alternative_evidence):
-        if not alternative_evidence or not np.any(candidate_mask):
-            return False, 0.0, 0.0
-        candidate_bbox = npmask2box(candidate_mask)
-        best_ratio_candidate = 0.0
-        best_ratio_alt = 0.0
-        for evidence_mask in alternative_evidence:
-            alternative_bbox = npmask2box(evidence_mask)
-            ratio_candidate, ratio_alt, _ = bbox_overlap_ratios(
-                candidate_bbox, alternative_bbox
-            )
-            best_ratio_candidate = max(best_ratio_candidate, ratio_candidate)
-            best_ratio_alt = max(best_ratio_alt, ratio_alt)
-            if (
-                ratio_candidate >= self.vt_alt_bbox_candidate_th
-                and ratio_alt >= self.vt_alt_bbox_alt_th
-            ):
-                return True, ratio_candidate, ratio_alt
-        return False, best_ratio_candidate, best_ratio_alt
 
     def _resolve_memory_lock_selection(self, alternative_masks_all, all_ious):
         """
@@ -796,8 +719,9 @@ class DAM4SAMMOT():
             source = candidate["source"]
 
             alt_passed, best_alt_candidate_ratio, best_alt_ratio = (
-                self._candidate_matches_alternative_evidence(
-                    candidate_mask, source["alternative_evidence"]
+                candidate_matches_alternative_evidence(
+                    candidate_mask, source["alternative_evidence"],
+                    self.vt_alt_bbox_candidate_th, self.vt_alt_bbox_alt_th
                 )
             )
             source_obj_id = candidate["source_obj_id"]
@@ -818,8 +742,9 @@ class DAM4SAMMOT():
                 visible_covered_masks.append(selected_mask)
                 visible_covered_obj_ids.append(f"selected_{source_obj_id}_{selected_idx}")
 
-            covered, ratio_candidate, ratio_tracker, overlap_obj_id = self._candidate_overlaps_existing_tracker(
-                candidate_mask, visible_covered_masks, visible_covered_obj_ids
+            covered, ratio_candidate, ratio_tracker, overlap_obj_id = candidate_overlaps_existing_tracker(
+                candidate_mask, visible_covered_masks, self.vt_tracker_overlap_th,
+                visible_covered_obj_ids
             )
             if covered:
                 rejected_overlap += 1
@@ -1518,9 +1443,10 @@ class DAM4SAMMOT():
                                     self.last_added[obj_idx] = self.frame_index # Update the last added frame index
                                     alternative_evidence = []
                                     if vt_spawn_allowed_this_frame and not selected_mask_is_alternative_by_obj_idx[obj_idx]:
-                                        alternative_evidence = self._build_vt_alternative_evidence(
+                                        alternative_evidence = build_vt_alternative_evidence(
                                             [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != m_idx],
                                             chosen_mask_np,
+                                            self.vt_alt_min_pixels,
                                         )
                                     if obj_id in self.real_obj_ids and alternative_evidence:
                                         x, y, w, h = chosen_bbox
