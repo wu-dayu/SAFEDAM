@@ -1131,31 +1131,18 @@ class DAM4SAMMOT():
         return (pred_masks_gpu, m, n_pixels_pos, maskmem_features,
                 alternative_masks_all, all_ious)
 
-    def track(self, image):
-        self.frame_index += 1
+    def _classify_selected_masks(self, memory_lock_selection, all_ious, n_pixels_pos):
+        """Resolve, per object, which mask index is used and how it was chosen.
 
-        # prepare image
-        img = self._prepare_image(image)
-        img = img.unsqueeze(0)  # (1, 3, 1024, 1024)
-        
-        # compute features
-        feats, pos, feat_sizes = self._get_features(img)  # Note: removed number of objects
-        
-        current_out = self._run_sam3_inference(img, feats, pos, feat_sizes)
-
-        (pred_masks_gpu, m, n_pixels_pos, maskmem_features,
-         alternative_masks_all, all_ious) = self._postprocess_predictions(current_out)
-
-        memory_lock_selection = self._resolve_memory_lock_selection(
-            alternative_masks_all, all_ious
-        ) if len(self.all_obj_ids) > 1 else [
-            {
-                "candidate_idx": int(np.argmax(all_ious[obj_idx])),
-                "mask": np.asarray(alternative_masks_all[obj_idx][int(np.argmax(all_ious[obj_idx]))]).astype(np.uint8),
-                "pred_iou": float(np.max(all_ious[obj_idx])),
-            }
-            for obj_idx in range(len(self.all_obj_ids))
-        ]
+        Read-only w.r.t. tracker state (only reads self.all_obj_ids). For each
+        object it compares the memory-lock choice against the argmax ("chosen")
+        mask and produces five parallel lists:
+            selected_mask_idx_by_obj_idx        - final mask index used
+            selected_pred_iou_by_obj_idx        - pred IoU (0.0 if unresolved)
+            selected_mask_is_resolved_by_obj_idx- lock produced a concrete mask
+            selected_mask_is_alternative_by_obj_idx - resolved AND != argmax
+            selected_n_pixels_pos_by_obj_idx    - pixel count of the used mask
+        """
         selected_mask_idx_by_obj_idx = []
         selected_pred_iou_by_obj_idx = []
         selected_mask_is_resolved_by_obj_idx = []
@@ -1185,7 +1172,20 @@ class DAM4SAMMOT():
                 if selected_mask_is_resolved
                 else int(n_pixels_pos[obj_idx])
             )
+        return (selected_mask_idx_by_obj_idx,
+                selected_pred_iou_by_obj_idx,
+                selected_mask_is_resolved_by_obj_idx,
+                selected_mask_is_alternative_by_obj_idx,
+                selected_n_pixels_pos_by_obj_idx)
 
+    def _update_overlap_freeze_state(self, m, current_out):
+        """Compute pairwise mask overlaps and update the freeze hysteresis gate.
+
+        Side effect: updates self.overlap_update_freeze_state in place. Only the
+        lower-object_score_logits object in each overlapping visible pair can be
+        frozen. overlap_info / overlap_info_valid / low_obj_max_overlap are local
+        (verified not used elsewhere). No return value.
+        """
         overlap_info = {}
         overlap_info_valid = False
         low_obj_max_overlap = {obj_id: 0.0 for obj_id in self.all_obj_ids}
@@ -1270,6 +1270,24 @@ class DAM4SAMMOT():
                 elif frozen and max_overlap < overlap_update_freeze_low_th:
                     self.overlap_update_freeze_state[obj_id] = False
 
+    def _update_object_memories(self, memory_lock_selection, alternative_masks_all,
+                                all_ious, selected_mask_idx_by_obj_idx,
+                                selected_pred_iou_by_obj_idx,
+                                selected_mask_is_resolved_by_obj_idx,
+                                selected_mask_is_alternative_by_obj_idx,
+                                selected_n_pixels_pos_by_obj_idx,
+                                pred_masks_gpu, maskmem_features, current_out,
+                                img, feats, pos, feat_sizes):
+        """Per-object memory update (RAM/DRM), obj_ptr, and VT source collection.
+
+        Moved verbatim from track(). Writes self.per_object_outputs_all,
+        self.per_object_obj_ptr, self.add_to_drm_next, self.last_added,
+        self.object_sizes and self.overlap_update_freeze_state. Handles the
+        chosen-vs-alternative mask cases (re-encoding memory features and
+        regenerating obj_ptr for alternative masks) and collects virtual-tracker
+        DRM sources. Returns (alternative_masks_to_return, vt_drm_sources,
+        vt_spawn_allowed_this_frame).
+        """
         alternative_masks_to_return = []
         vt_drm_sources = []
         vt_spawn_allowed_this_frame = not any(
@@ -1544,19 +1562,16 @@ class DAM4SAMMOT():
                                                 # remove from RAM elsewhere
                                                 ram_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and not mem_el['is_drm'])]
                                                 obj_mem.pop(ram_idxs[0])
-            
-        tracked_obj_ids = list(self.all_obj_ids)
-            
-        if vt_spawn_allowed_this_frame:
-            self._maybe_spawn_virtual_trackers(
-                image=image,
-                masks=m,
-                drm_sources=vt_drm_sources,
-                img=img,
-                feats=feats,
-                pos=pos,
-                feat_sizes=feat_sizes,
-            )
+
+        return (alternative_masks_to_return, vt_drm_sources,
+                vt_spawn_allowed_this_frame)
+
+    def _cleanup_empty_virtual_trackers(self, tracked_obj_ids, n_pixels_pos):
+        """Remove virtual trackers whose masks have been empty for too long.
+
+        Writes self.virtual_empty_frame_count and calls _remove_virtual_trackers.
+        No return value.
+        """
         virtual_obj_ids_to_remove = []
         for obj_idx, obj_id in enumerate(tracked_obj_ids):
             if obj_id not in self.virtual_obj_ids:
@@ -1572,6 +1587,15 @@ class DAM4SAMMOT():
         if virtual_obj_ids_to_remove:
             self._remove_virtual_trackers(virtual_obj_ids_to_remove)
 
+    def _prepare_outputs(self, m, tracked_obj_ids, memory_lock_selection,
+                         selected_mask_is_alternative_by_obj_idx,
+                         alternative_masks_to_return):
+        """Assemble the returned masks for the real (non-virtual) objects.
+
+        Read-only w.r.t. tracker state. Applies the alternative-mask substitution
+        and the overlap-freeze suppression before selecting real-object outputs.
+        Returns {'masks': ..., 'alternative_masks': ...}.
+        """
         output_masks_by_obj_idx = [
             np.asarray(mask).squeeze().astype(np.uint8).copy()
             for mask in m
@@ -1606,3 +1630,68 @@ class DAM4SAMMOT():
 
         outputs = {'masks': real_outputs, 'alternative_masks': real_alternative_outputs}
         return outputs
+
+    def track(self, image):
+        self.frame_index += 1
+
+        # prepare image
+        img = self._prepare_image(image)
+        img = img.unsqueeze(0)  # (1, 3, 1024, 1024)
+        
+        # compute features
+        feats, pos, feat_sizes = self._get_features(img)  # Note: removed number of objects
+        
+        current_out = self._run_sam3_inference(img, feats, pos, feat_sizes)
+
+        (pred_masks_gpu, m, n_pixels_pos, maskmem_features,
+         alternative_masks_all, all_ious) = self._postprocess_predictions(current_out)
+
+        memory_lock_selection = self._resolve_memory_lock_selection(
+            alternative_masks_all, all_ious
+        ) if len(self.all_obj_ids) > 1 else [
+            {
+                "candidate_idx": int(np.argmax(all_ious[obj_idx])),
+                "mask": np.asarray(alternative_masks_all[obj_idx][int(np.argmax(all_ious[obj_idx]))]).astype(np.uint8),
+                "pred_iou": float(np.max(all_ious[obj_idx])),
+            }
+            for obj_idx in range(len(self.all_obj_ids))
+        ]
+        (selected_mask_idx_by_obj_idx,
+         selected_pred_iou_by_obj_idx,
+         selected_mask_is_resolved_by_obj_idx,
+         selected_mask_is_alternative_by_obj_idx,
+         selected_n_pixels_pos_by_obj_idx) = self._classify_selected_masks(
+            memory_lock_selection, all_ious, n_pixels_pos
+        )
+
+        self._update_overlap_freeze_state(m, current_out)
+
+        (alternative_masks_to_return, vt_drm_sources,
+         vt_spawn_allowed_this_frame) = self._update_object_memories(
+            memory_lock_selection, alternative_masks_all, all_ious,
+            selected_mask_idx_by_obj_idx, selected_pred_iou_by_obj_idx,
+            selected_mask_is_resolved_by_obj_idx,
+            selected_mask_is_alternative_by_obj_idx,
+            selected_n_pixels_pos_by_obj_idx,
+            pred_masks_gpu, maskmem_features, current_out,
+            img, feats, pos, feat_sizes,
+        )
+            
+        tracked_obj_ids = list(self.all_obj_ids)
+            
+        if vt_spawn_allowed_this_frame:
+            self._maybe_spawn_virtual_trackers(
+                image=image,
+                masks=m,
+                drm_sources=vt_drm_sources,
+                img=img,
+                feats=feats,
+                pos=pos,
+                feat_sizes=feat_sizes,
+            )
+        self._cleanup_empty_virtual_trackers(tracked_obj_ids, n_pixels_pos)
+
+        return self._prepare_outputs(
+            m, tracked_obj_ids, memory_lock_selection,
+            selected_mask_is_alternative_by_obj_idx, alternative_masks_to_return,
+        )
