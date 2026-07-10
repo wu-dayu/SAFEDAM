@@ -186,7 +186,7 @@ class DAM4SAMMOT():
         self.use_last = True  # always use last frame in RAM
         self.add_to_drm_next = {}  # needed for DRM update (to prevent adding twice the same frame to the memory)
 
-        self.use_adaptive_update_gate = True
+        self.use_adaptive_update_gate = False
         self.update_gate_window = 20
         self.update_gate_moving_window = 10
         self.update_gate_warmup = 3
@@ -1299,7 +1299,7 @@ class DAM4SAMMOT():
         selected_pred_iou_by_obj_idx = []
         selected_mask_is_resolved_by_obj_idx = []
         selected_mask_is_alternative_by_obj_idx = []
-        resolved_masks_by_obj_idx = []
+        selected_n_pixels_pos_by_obj_idx = []
         for obj_idx in range(len(self.all_obj_ids)):
             lock_choice = memory_lock_selection[obj_idx] if obj_idx < len(memory_lock_selection) else {
                 "candidate_idx": None,
@@ -1319,17 +1319,11 @@ class DAM4SAMMOT():
             selected_pred_iou_by_obj_idx.append(
                 float(lock_choice["pred_iou"]) if selected_mask_is_resolved else 0.0
             )
-            if selected_mask_is_resolved:
-                selected_mask_np = lock_choice["mask"]
-            else:
-                selected_mask_np = alternative_masks_all[obj_idx][chosen_mask_idx]
-            resolved_masks_by_obj_idx.append(np.asarray(selected_mask_np).squeeze().astype(np.uint8))
-
-        m = [
-            np.asarray(mask).squeeze().astype(np.uint8)
-            for mask in resolved_masks_by_obj_idx
-        ]
-        n_pixels_pos = [int(mask.sum()) for mask in m]
+            selected_n_pixels_pos_by_obj_idx.append(
+                int(np.asarray(lock_choice["mask"]).sum())
+                if selected_mask_is_resolved
+                else int(n_pixels_pos[obj_idx])
+            )
 
         overlap_info = {}
         overlap_info_valid = False
@@ -1384,23 +1378,23 @@ class DAM4SAMMOT():
                 )
                 """
 
-            # 输出重叠信息
-            """
+            
             if overlap_info:
-                
+                """
                 print(
                     f"Frame {self.frame_index} Mask Overlap Summary "
                     f"(largest connected components):"
                 )
-                
+                """
                 for (obj_id_i, obj_id_j), info in overlap_info.items():
+                    """
                     print(
                         f"  Obj {obj_id_i} <-> Obj {obj_id_j}: "
                         f"intersection={info['intersection']}, "
                         f"ratio_with_obj{obj_id_i}={info['ratio_i']:.4f}, "
                         f"ratio_with_obj{obj_id_j}={info['ratio_j']:.4f}"
                     )
-            """
+                    """
         # Overlap-aware memory update freeze gate (hysteresis).
         # Only affects the lower object_score_logits object in each overlapping pair.
         if not hasattr(self, "overlap_update_freeze_state"):
@@ -1456,10 +1450,10 @@ class DAM4SAMMOT():
             }
 
             # for alternative masks debug
-            chosen_mask_idx = selected_mask_idx_by_obj_idx[obj_idx]
+            selected_mask_idx = selected_mask_idx_by_obj_idx[obj_idx]
             alternative_masks = [
                 mask for i, mask in enumerate(alternative_masks_all[obj_idx])
-                if i != chosen_mask_idx and float(all_ious[obj_idx][i]) > 0.7
+                if i != selected_mask_idx and float(all_ious[obj_idx][i]) > 0.7
             ]
             alternative_masks_to_return.append([np.asarray(mask).squeeze().astype(np.uint8) for mask in alternative_masks])
 
@@ -1486,7 +1480,7 @@ class DAM4SAMMOT():
             last_ram_frame = max(ram_frame_candidates) if len(ram_frame_candidates) > 0 else None
             update_gate, update_gate_stats = self._get_adaptive_update_gate(
                 obj_idx=obj_idx,
-                n_pixels_pos=n_pixels_pos[obj_idx],
+                n_pixels_pos=selected_n_pixels_pos_by_obj_idx[obj_idx],
                 max_pred_iou=max_pred_iou,
                 obj_score=obj_score,
                 score_iou=score_iou,
@@ -1517,195 +1511,199 @@ class DAM4SAMMOT():
                         f"Memory lock: Frame {self.frame_index}, Obj {obj_id} has no unlocked candidate, skip memory update."
                     )
                     """
-                    continue
-                selected_mask_lowres = self._mask_to_lowres_tensor(
-                    selected_mask_np,
-                    pred_masks_gpu.shape[-2:],
-                    pred_masks_gpu.device,
-                )
-                if self.fill_hole_area > 0:
-                    selected_mask_lowres = fill_holes_in_mask_scores(
-                        selected_mask_lowres, self.fill_hole_area
-                    )
-                selected_mask_high_res = torch.nn.functional.interpolate(
-                    selected_mask_lowres.to(img.device, non_blocking=True),
-                    size=(self.sam.image_size, self.sam.image_size),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                selected_maskmem_features, selected_maskmem_pos_enc = self.sam._encode_new_memory(
-                    image=img,
-                    current_vision_feats=feats,
-                    feat_sizes=feat_sizes,
-                    pred_masks_high_res=selected_mask_high_res,
-                    object_score_logits=current_out["object_score_logits"][obj_idx].unsqueeze(0),
-                    is_mask_from_pts=False,
-                )
-                selected_maskmem_features = selected_maskmem_features.to(torch.bfloat16)
-                selected_maskmem_features = selected_maskmem_features.to(img.device, non_blocking=True)
-                self._record_memory_update_trigger(obj_idx, score_iou, obj_score)
-
-                # Update object pointers firs
-                per_obj_obj_ptr_dict = {"obj_ptr": current_out["obj_ptr"][obj_idx].unsqueeze(0), 
-                                        "frame_idx": self.frame_index, "is_init": False}
-                obj_mem_obj_ptr = self.per_object_obj_ptr[obj_id]
-                obj_mem_obj_ptr.append(per_obj_obj_ptr_dict)
-                if len(obj_mem_obj_ptr) > self.sam.max_obj_ptrs_in_encoder:
-                    # get first non-init frame and remove it from the list
-                    rem_idx = None
-                    for i, ptr_el in enumerate(obj_mem_obj_ptr):
-                        if not ptr_el["is_init"]:
-                            rem_idx = i
-                            break
-                    if rem_idx:
-                        obj_mem_obj_ptr.pop(rem_idx)
-
-                # Here the per-object update is performed
-                # create object dict and append it to list
-                per_obj_dict = {
-                    "maskmem_features": selected_maskmem_features,  # (1, 64, 64, 64)
-                    "pred_masks": selected_mask_lowres.detach().cpu().numpy(),  # (1, 1, 256, 256)
-                    "is_init": False, "frame_idx": self.frame_index, "is_drm": False
-                }
-
-                if self.use_last:
-                    ram_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and not mem_el['is_drm'])]
-                    
-                    if len(ram_idxs) == 0:
-                        obj_mem.append(per_obj_dict)
-                    elif (self.frame_index % cur_update_delta) == 0:
-                        if (obj_mem[ram_idxs[-1]]['frame_idx'] % cur_update_delta) == 0:
-                            obj_mem.append(per_obj_dict)
-                        else:
-                            obj_mem[ram_idxs[-1]] = per_obj_dict
-                    else:
-                        if (obj_mem[ram_idxs[-1]]['frame_idx'] % cur_update_delta) == 0:
-                            obj_mem.append(per_obj_dict)
-                        else:
-                            obj_mem[ram_idxs[-1]] = per_obj_dict
+                    update_gate = False
                 else:
-                    if (self.frame_index % cur_update_delta) == 0:
-                        obj_mem.append(per_obj_dict)
-
-                # check if memory is full for this object
-                # remove the oldest non-init RAM element
-                ram_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and not mem_el['is_drm'])]
-                if len(ram_idxs) > self.max_ram and len(obj_mem) > self.sam.num_maskmem:
-                    obj_mem.pop(ram_idxs[0])
-                
-                # update the DRM memory - but first, check if DRM is even in use
-                if self.max_drm > 0:
-                    # check for update the DRM part of the memory
-                    m_idx = int(selected_mask_idx_by_obj_idx[obj_idx])
-                    m_iou = float(lock_choice["pred_iou"])
-                    if m_iou <= 0.7:
-                        continue
-                    # Delete the chosen predicted mask from the list of all predicted masks, leading to only alternative masks
-                    alternative_masks = [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != m_idx]
-
-                    # Determine if the object ratio between the current frame and the previous frames is within a certain range
-                    self.object_sizes[obj_idx].append(n_pixels_pos[obj_idx])
-                    if len(self.object_sizes[obj_idx]) > 1:
-                        obj_sizes_ratio = n_pixels_pos[obj_idx] / np.median([
-                            size for size in self.object_sizes[obj_idx][-300:] if size >= 1
-                        ][-10:])
+                    selected_mask_lowres = self._mask_to_lowres_tensor(
+                        selected_mask_np,
+                        pred_masks_gpu.shape[-2:],
+                        pred_masks_gpu.device,
+                    )
+                    if selected_mask_is_alternative_by_obj_idx[obj_idx]:
+                        if self.fill_hole_area > 0:
+                            selected_mask_lowres = fill_holes_in_mask_scores(
+                                selected_mask_lowres, self.fill_hole_area
+                            )
+                        selected_mask_high_res = torch.nn.functional.interpolate(
+                            selected_mask_lowres.to(img.device, non_blocking=True),
+                            size=(self.sam.image_size, self.sam.image_size),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        selected_maskmem_features, _ = self.sam._encode_new_memory(
+                            image=img,
+                            current_vision_feats=feats,
+                            feat_sizes=feat_sizes,
+                            pred_masks_high_res=selected_mask_high_res,
+                            object_score_logits=current_out["object_score_logits"][obj_idx].unsqueeze(0),
+                            is_mask_from_pts=False,
+                        )
+                        selected_maskmem_features = selected_maskmem_features.to(torch.bfloat16)
+                        selected_maskmem_features = selected_maskmem_features.to(img.device, non_blocking=True)
                     else:
-                        obj_sizes_ratio = -1
+                        selected_maskmem_features = maskmem_features[obj_idx].unsqueeze(0)
+                    self._record_memory_update_trigger(obj_idx, score_iou, obj_score)
 
-                    # The first condition checks if:
-                    #  - the chosen predicted mask has a high predicted IoU, 
-                    #  - the object size ratio is within a +- 20% range compared to the previous frames, 
-                    #  - the target is present in the current frame,
-                    #  - the last added frame to DRM is more than 5 frames ago or no frame has been added yet
-                    """
-                    print(f"DRM CHECK: Frame {self.frame_index}, Obj {obj_id} DRM parameters: m_iou={m_iou:.4f}, obj_sizes_ratio={obj_sizes_ratio:.4f}, frame_index - last_added={self.frame_index - self.last_added[obj_idx]}, last_added={self.last_added[obj_idx]}, DRM first gate={m_iou > 0.8 and obj_sizes_ratio >= 0.8 and obj_sizes_ratio <= 1.2 and (self.frame_index - self.last_added[obj_idx] > self.update_delta or self.last_added[obj_idx] == -1)}")
-                    """
-                    if m_iou > 0.8 and obj_sizes_ratio >= 0.8 and obj_sizes_ratio <= 1.2 and \
-                        (self.frame_index - self.last_added[obj_idx] > cur_update_delta or self.last_added[obj_idx] == -1):
-                        # Numpy array of the chosen mask and corresponding bounding box
-                        chosen_mask_np = selected_mask_np
-                        chosen_bbox = self._npmask2box(chosen_mask_np)
+                    # Update object pointers firs
+                    per_obj_obj_ptr_dict = {"obj_ptr": current_out["obj_ptr"][obj_idx].unsqueeze(0), 
+                                            "frame_idx": self.frame_index, "is_init": False}
+                    obj_mem_obj_ptr = self.per_object_obj_ptr[obj_id]
+                    obj_mem_obj_ptr.append(per_obj_obj_ptr_dict)
+                    if len(obj_mem_obj_ptr) > self.sam.max_obj_ptrs_in_encoder:
+                        # get first non-init frame and remove it from the list
+                        rem_idx = None
+                        for i, ptr_el in enumerate(obj_mem_obj_ptr):
+                            if not ptr_el["is_init"]:
+                                rem_idx = i
+                                break
+                        if rem_idx:
+                            obj_mem_obj_ptr.pop(rem_idx)
 
-                        # Delete the parts of the alternative masks that overlap with the chosen mask
-                        alternative_masks = [np.logical_and(m_, np.logical_not(chosen_mask_np)).astype(np.uint8) for m_ in alternative_masks]
-                        # Keep only the largest connected component of the processed alternative masks
-                        alternative_masks = [keep_largest_component(m_) for m_ in alternative_masks if np.sum(m_) >= 1]
-                        if len(alternative_masks) > 0:
-                            # Make the union of the chosen mask and the processed alternative masks (corresponding to the largest connected component)
-                            alternative_masks = [np.logical_or(m_, chosen_mask_np).astype(np.uint8) for m_ in alternative_masks]
-                            # Convert the processed alternative masks to bounding boxes to calculate the IoUs bounding box-wise
-                            alternative_bboxes = [self._npmask2box(m_) for m_ in alternative_masks]
-                            # Calculate the IoUs between the chosen bounding box and the processed alternative bounding boxes
-                            ious = [calculate_overlaps([Rectangle(*chosen_bbox)], [Rectangle(*bbox)])[0] for bbox in alternative_bboxes]
-                            # The second condition checks if within the calculated IoUs, there is at least one IoU that is less than 0.7
-                            # That would mean that there are significant differences between the chosen mask and the processed alternative masks, 
-                            # leading to possible detections of distractors within alternative masks.
-                            """
-                            print(f"DRM CHECK: Frame {self.frame_index}, Obj {obj_id} DRM parameters: bbox divergence={np.min(np.array(ious)):.4f}, DRM trigger={np.min(np.array(ious)) <= 0.7}")
-                            """
-                            if np.min(np.array(ious)) <= 0.7:
-                                self.last_added[obj_idx] = self.frame_index # Update the last added frame index
-                                alternative_evidence = []
-                                if vt_spawn_allowed_this_frame and not selected_mask_is_alternative_by_obj_idx[obj_idx]:
-                                    alternative_evidence = self._build_vt_alternative_evidence(
-                                        [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != m_idx],
-                                        chosen_mask_np,
-                                    )
-                                if obj_id in self.real_obj_ids and alternative_evidence:
-                                    x, y, w, h = chosen_bbox
-                                    alt_evidence_bboxes = [
-                                        self._npmask2box(evidence_mask)
-                                        for evidence_mask in alternative_evidence
-                                    ]
-                                    """
-                                    print(
-                                        f"[VT DEBUG] Frame {self.frame_index}: Add DRM detector source Obj {obj_id}, "
-                                        f"anchor_bbox={chosen_bbox}, normalized_box=("
-                                        f"{(x + 0.5 * w) / self.img_width:.4f}, "
-                                        f"{(y + 0.5 * h) / self.img_height:.4f}, "
-                                        f"{w / self.img_width:.4f}, {h / self.img_height:.4f}), "
-                                        f"alt_components={len(alternative_evidence)}, "
-                                        f"alt_bboxes={alt_evidence_bboxes}"
-                                    )
-                                    """
-                                    vt_drm_sources.append({
-                                        "obj_id": obj_id,
-                                        "box": [
-                                            (x + 0.5 * w) / self.img_width,
-                                            (y + 0.5 * h) / self.img_height,
-                                            w / self.img_width,
-                                            h / self.img_height,
-                                        ],
-                                        "center": (x + 0.5 * w, y + 0.5 * h),
-                                        "alternative_evidence": alternative_evidence,
-                                    })
+                    # Here the per-object update is performed
+                    # create object dict and append it to list
+                    per_obj_dict = {
+                        "maskmem_features": selected_maskmem_features,  # (1, 64, 64, 64)
+                        "pred_masks": selected_mask_lowres.detach().cpu().numpy(),  # (1, 1, 256, 256)
+                        "is_init": False, "frame_idx": self.frame_index, "is_drm": False
+                    }
+
+                    if self.use_last:
+                        ram_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and not mem_el['is_drm'])]
+                        
+                        if len(ram_idxs) == 0:
+                            obj_mem.append(per_obj_dict)
+                        elif (self.frame_index % cur_update_delta) == 0:
+                            if (obj_mem[ram_idxs[-1]]['frame_idx'] % cur_update_delta) == 0:
+                                obj_mem.append(per_obj_dict)
+                            else:
+                                obj_mem[ram_idxs[-1]] = per_obj_dict
+                        else:
+                            if (obj_mem[ram_idxs[-1]]['frame_idx'] % cur_update_delta) == 0:
+                                obj_mem.append(per_obj_dict)
+                            else:
+                                obj_mem[ram_idxs[-1]] = per_obj_dict
+                    else:
+                        if (self.frame_index % cur_update_delta) == 0:
+                            obj_mem.append(per_obj_dict)
+
+                    # check if memory is full for this object
+                    # remove the oldest non-init RAM element
+                    ram_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and not mem_el['is_drm'])]
+                    if len(ram_idxs) > self.max_ram and len(obj_mem) > self.sam.num_maskmem:
+                        obj_mem.pop(ram_idxs[0])
+                    
+                    # update the DRM memory - but first, check if DRM is even in use
+                    if self.max_drm > 0:
+                        # check for update the DRM part of the memory
+                        m_idx = int(selected_mask_idx_by_obj_idx[obj_idx])
+                        m_iou = float(lock_choice["pred_iou"])
+                        # Delete the chosen predicted mask from the list of all predicted masks, leading to only alternative masks
+                        alternative_masks = [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != m_idx]
+
+                        # Determine if the object ratio between the current frame and the previous frames is within a certain range
+                        self.object_sizes[obj_idx].append(
+                            selected_n_pixels_pos_by_obj_idx[obj_idx]
+                        )
+                        if len(self.object_sizes[obj_idx]) > 1:
+                            obj_sizes_ratio = selected_n_pixels_pos_by_obj_idx[obj_idx] / np.median([
+                                size for size in self.object_sizes[obj_idx][-300:] if size >= 1
+                            ][-10:])
+                        else:
+                            obj_sizes_ratio = -1
+
+                        # The first condition checks if:
+                        #  - the chosen predicted mask has a high predicted IoU, 
+                        #  - the object size ratio is within a +- 20% range compared to the previous frames, 
+                        #  - the target is present in the current frame,
+                        #  - the last added frame to DRM is more than 5 frames ago or no frame has been added yet
+                        """
+                        print(f"DRM CHECK: Frame {self.frame_index}, Obj {obj_id} DRM parameters: m_iou={m_iou:.4f}, obj_sizes_ratio={obj_sizes_ratio:.4f}, frame_index - last_added={self.frame_index - self.last_added[obj_idx]}, last_added={self.last_added[obj_idx]}, DRM first gate={m_iou > 0.8 and obj_sizes_ratio >= 0.8 and obj_sizes_ratio <= 1.2 and (self.frame_index - self.last_added[obj_idx] > self.update_delta or self.last_added[obj_idx] == -1)}")
+                        """
+                        if m_iou > 0.8 and obj_sizes_ratio >= 0.8 and obj_sizes_ratio <= 1.2 and \
+                            (self.frame_index - self.last_added[obj_idx] > cur_update_delta or self.last_added[obj_idx] == -1):
+                            # Numpy array of the chosen mask and corresponding bounding box
+                            chosen_mask_np = selected_mask_np
+                            chosen_bbox = self._npmask2box(chosen_mask_np)
+
+                            # Delete the parts of the alternative masks that overlap with the chosen mask
+                            alternative_masks = [np.logical_and(m_, np.logical_not(chosen_mask_np)).astype(np.uint8) for m_ in alternative_masks]
+                            # Keep only the largest connected component of the processed alternative masks
+                            alternative_masks = [keep_largest_component(m_) for m_ in alternative_masks if np.sum(m_) >= 1]
+                            if len(alternative_masks) > 0:
+                                # Make the union of the chosen mask and the processed alternative masks (corresponding to the largest connected component)
+                                alternative_masks = [np.logical_or(m_, chosen_mask_np).astype(np.uint8) for m_ in alternative_masks]
+                                # Convert the processed alternative masks to bounding boxes to calculate the IoUs bounding box-wise
+                                alternative_bboxes = [self._npmask2box(m_) for m_ in alternative_masks]
+                                # Calculate the IoUs between the chosen bounding box and the processed alternative bounding boxes
+                                ious = [calculate_overlaps([Rectangle(*chosen_bbox)], [Rectangle(*bbox)])[0] for bbox in alternative_bboxes]
+                                # The second condition checks if within the calculated IoUs, there is at least one IoU that is less than 0.7
+                                # That would mean that there are significant differences between the chosen mask and the processed alternative masks, 
+                                # leading to possible detections of distractors within alternative masks.
+                                """
+                                print(f"DRM CHECK: Frame {self.frame_index}, Obj {obj_id} DRM parameters: bbox divergence={np.min(np.array(ious)):.4f}, DRM trigger={np.min(np.array(ious)) <= 0.7}")
+                                """
+                                if np.min(np.array(ious)) <= 0.7:
+                                    self.last_added[obj_idx] = self.frame_index # Update the last added frame index
+                                    alternative_evidence = []
+                                    if vt_spawn_allowed_this_frame and not selected_mask_is_alternative_by_obj_idx[obj_idx]:
+                                        alternative_evidence = self._build_vt_alternative_evidence(
+                                            [mask for i, mask in enumerate(alternative_masks_all[obj_idx]) if i != m_idx],
+                                            chosen_mask_np,
+                                        )
+                                    if obj_id in self.real_obj_ids and alternative_evidence:
+                                        x, y, w, h = chosen_bbox
+                                        alt_evidence_bboxes = [
+                                            self._npmask2box(evidence_mask)
+                                            for evidence_mask in alternative_evidence
+                                        ]
+                                        """
+                                        print(
+                                            f"[VT DEBUG] Frame {self.frame_index}: Add DRM detector source Obj {obj_id}, "
+                                            f"anchor_bbox={chosen_bbox}, normalized_box=("
+                                            f"{(x + 0.5 * w) / self.img_width:.4f}, "
+                                            f"{(y + 0.5 * h) / self.img_height:.4f}, "
+                                            f"{w / self.img_width:.4f}, {h / self.img_height:.4f}), "
+                                            f"alt_components={len(alternative_evidence)}, "
+                                            f"alt_bboxes={alt_evidence_bboxes}"
+                                        )
+                                        """
+                                        vt_drm_sources.append({
+                                            "obj_id": obj_id,
+                                            "box": [
+                                                (x + 0.5 * w) / self.img_width,
+                                                (y + 0.5 * h) / self.img_height,
+                                                w / self.img_width,
+                                                h / self.img_height,
+                                            ],
+                                            "center": (x + 0.5 * w, y + 0.5 * h),
+                                            "alternative_evidence": alternative_evidence,
+                                        })
                                 
-                                # add element to DRM
-                                per_obj_dict = {
-                                    "maskmem_features": selected_maskmem_features,  # (1, 64, 64, 64)
-                                    "pred_masks": selected_mask_lowres.detach().cpu().numpy(),  # (1, 1, 256, 256)
-                                    "is_init": False, "frame_idx": self.frame_index, "is_drm": True
-                                }
+                                    # add element to DRM
+                                    per_obj_dict = {
+                                        "maskmem_features": selected_maskmem_features,  # (1, 64, 64, 64)
+                                        "pred_masks": selected_mask_lowres.detach().cpu().numpy(),  # (1, 1, 256, 256)
+                                        "is_init": False, "frame_idx": self.frame_index, "is_drm": True
+                                    }
                                 
-                                if self.frame_index == obj_mem[-1]['frame_idx']:
-                                    # this frame is already in RAM; 
-                                    # put into the temporary mem structure and add to DRM in the next frame
-                                    self.add_to_drm_next[obj_id] = per_obj_dict
-                                else:
-                                    # this frame is not in RAM yet - add directly to DRM
-                                    obj_mem.append(per_obj_dict)
+                                    if self.frame_index == obj_mem[-1]['frame_idx']:
+                                        # this frame is already in RAM; 
+                                        # put into the temporary mem structure and add to DRM in the next frame
+                                        self.add_to_drm_next[obj_id] = per_obj_dict
+                                    else:
+                                        # this frame is not in RAM yet - add directly to DRM
+                                        obj_mem.append(per_obj_dict)
                                     
-                                    # check if memory is full for this object
-                                    # remove the oldest non-init DRM element
-                                    if len(obj_mem) > self.sam.num_maskmem:
-                                        drm_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and mem_el['is_drm'])]
-                                        if len(drm_idxs) > self.max_drm:
-                                            # remove from DRM if more than max DRM elements
-                                            obj_mem.pop(drm_idxs[0])
-                                        else:
-                                            # remove from RAM elsewhere
-                                            ram_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and not mem_el['is_drm'])]
-                                            obj_mem.pop(ram_idxs[0])
+                                        # check if memory is full for this object
+                                        # remove the oldest non-init DRM element
+                                        if len(obj_mem) > self.sam.num_maskmem:
+                                            drm_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and mem_el['is_drm'])]
+                                            if len(drm_idxs) > self.max_drm:
+                                                # remove from DRM if more than max DRM elements
+                                                obj_mem.pop(drm_idxs[0])
+                                            else:
+                                                # remove from RAM elsewhere
+                                                ram_idxs = [mem_idx for mem_idx, mem_el in enumerate(obj_mem) if (not mem_el['is_init'] and not mem_el['is_drm'])]
+                                                obj_mem.pop(ram_idxs[0])
             """
             print(
                 f"Memory update gate: Frame {self.frame_index}, Obj {obj_id}, "
@@ -1746,12 +1744,6 @@ class DAM4SAMMOT():
             for obj_idx, obj_id in enumerate(tracked_obj_ids)
             if obj_id in self.real_obj_ids
         ]
-        outputs = {
-            'masks': [m[obj_idx] for obj_idx in real_indices],
-            'alternative_masks': [
-                alternative_masks_to_return[obj_idx] for obj_idx in real_indices
-            ],
-        }
         virtual_obj_ids_to_remove = []
         for obj_idx, obj_id in enumerate(tracked_obj_ids):
             if obj_id not in self.virtual_obj_ids:
@@ -1766,23 +1758,37 @@ class DAM4SAMMOT():
                 virtual_obj_ids_to_remove.append(obj_id)
         if virtual_obj_ids_to_remove:
             self._remove_virtual_trackers(virtual_obj_ids_to_remove)
-            
+
+        output_masks_by_obj_idx = [
+            np.asarray(mask).squeeze().astype(np.uint8).copy()
+            for mask in m
+        ]
+        for obj_idx in range(len(tracked_obj_ids)):
+            if selected_mask_is_alternative_by_obj_idx[obj_idx]:
+                selected_mask_np = memory_lock_selection[obj_idx]["mask"]
+                if selected_mask_np is not None:
+                    output_masks_by_obj_idx[obj_idx] = (
+                        np.asarray(selected_mask_np).squeeze().astype(np.uint8).copy()
+                    )
+
         # If an object's memory update is frozen due to overlap, suppress its output mask.
         # This is applied right before returning outputs to avoid affecting any earlier logic.
         if getattr(self, "overlap_update_freeze_state", None):
-            for obj_idx, obj_id in enumerate(self.all_obj_ids):
+            for obj_idx, obj_id in enumerate(tracked_obj_ids):
                 if self.overlap_update_freeze_state.get(obj_id, False):
                     try:
-                        m[obj_idx][...] = 0
+                        output_masks_by_obj_idx[obj_idx][...] = 0
                     except Exception:
-                        m[obj_idx] = np.zeros_like(m[obj_idx])
+                        output_masks_by_obj_idx[obj_idx] = np.zeros_like(
+                            output_masks_by_obj_idx[obj_idx]
+                        )
         real_outputs = []
         real_alternative_outputs = []
         for obj_id in self.real_obj_ids:
-            if obj_id not in self.all_obj_ids:
+            if obj_id not in tracked_obj_ids:
                 continue
-            obj_idx = self.all_obj_ids.index(obj_id)
-            real_outputs.append(m[obj_idx])
+            obj_idx = tracked_obj_ids.index(obj_id)
+            real_outputs.append(output_masks_by_obj_idx[obj_idx])
             real_alternative_outputs.append(alternative_masks_to_return[obj_idx])
 
         outputs = {'masks': real_outputs, 'alternative_masks': real_alternative_outputs}
