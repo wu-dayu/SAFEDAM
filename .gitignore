@@ -10,7 +10,6 @@ __pycache__/
 .ipynb_checkpoints/
 .codex/
 .agents/
-checkpoints/
 
 _sam3/
 *.pth
