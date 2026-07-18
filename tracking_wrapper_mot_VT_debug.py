@@ -1268,9 +1268,9 @@ class DAM4SAMMOT():
             )
             self._record_score_iou_observation(obj_idx, score_iou, obj_score)
 
-            has_resolved_mask = bool(selected_mask_is_resolved_by_obj_idx[obj_idx])
+            has_alternative_mask = bool(selected_mask_is_alternative_by_obj_idx[obj_idx])
             was_frozen = bool(self.overlap_update_freeze_state.get(obj_id, False))
-            if has_resolved_mask:
+            if has_alternative_mask:
                 self.overlap_update_freeze_state[obj_id] = False
             elif was_frozen:
                 update_gate = False
